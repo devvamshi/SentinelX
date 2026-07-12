@@ -184,42 +184,126 @@ class FraudDetectionModel:
         return features
 
     def train_from_csv(self, csv_path: str):
-        """Train model and PCA on external CSV data."""
+        """Train model and PCA on external CSV data with realistic feature variance."""
         if not os.path.exists(csv_path): return False
         try:
             print(f"[ML] Training Hardcore model on: {csv_path}")
             df = pd.read_csv(csv_path)
+            
+            # Subsample for faster training and balanced representation
+            df_sampled = df.sample(n=min(10000, len(df)), random_state=42)
+            
             rows = []
-            for _, row in df.iterrows():
+            
+            # 1. Generate Normal Transactions
+            for _, row in df_sampled.iterrows():
                 try: dt = pd.to_datetime(row['TransactionDate'])
                 except: dt = datetime.now()
                 
                 rows.append([
-                    float(dt.hour), float(dt.weekday()), 1.0, 1.0, # Known device/loc baseline
+                    float(dt.hour), float(dt.weekday()), 
+                    1.0, 1.0, # Known device/location
                     float(row['TransactionAmount']),
-                    float(row['TransactionAmount']), # Proxy for last 1h
-                    0.0, 1.0, # Proxy freq
+                    float(row['TransactionAmount']), # amount last 1h
+                    0.0, 2.0, # failed login = 0, freq = 2
                     float(row.get('LoginAttempts', 1)),
-                    0.0, # Velocity (assume 0 in clean training)
-                    0.0  # Z-Score (assume normal in training)
+                    0.0, # travel velocity = 0
+                    0.0  # z-score normal
                 ])
                 
+            # 2. Generate Normal Logins (amount = 0)
+            for _, row in df_sampled.iterrows():
+                try: dt = pd.to_datetime(row['TransactionDate'])
+                except: dt = datetime.now()
+                
+                rows.append([
+                    float(dt.hour), float(dt.weekday()), 
+                    1.0, 1.0, # Known device/location
+                    0.0, # amount = 0
+                    0.0, # amount last 1h = 0
+                    0.0, 1.0, # failed login = 0, freq = 1
+                    1.0, # login attempts = 1
+                    0.0, # travel velocity = 0
+                    0.0  # z-score normal
+                ])
+                
+            # 3. Inject Simulated Anomalies (to introduce variance for StandardScaler and PCA)
+            np.random.seed(42)
+            num_anomalies = 600
+            
+            for i in range(num_anomalies):
+                # Random time
+                hour = float(np.random.randint(0, 24))
+                day = float(np.random.randint(0, 7))
+                
+                anomaly_type = i % 4
+                if anomaly_type == 0:
+                    # Impossible Travel
+                    rows.append([
+                        hour, day, 
+                        1.0, 0.0, # Known device, Unknown location
+                        0.0, 0.0,
+                        0.0, 1.0,
+                        1.0,
+                        float(np.random.uniform(600.0, 2500.0)), # High velocity
+                        0.0
+                    ])
+                elif anomaly_type == 1:
+                    # Brute Force
+                    rows.append([
+                        hour, day, 
+                        0.0, 1.0, # Unknown device, Known location
+                        0.0, 0.0,
+                        float(np.random.randint(4, 9)), # Multiple failed logins
+                        float(np.random.randint(5, 10)), # High event frequency
+                        float(np.random.randint(4, 9)), # High login attempts count
+                        0.0,
+                        0.0
+                    ])
+                elif anomaly_type == 2:
+                    # Transaction Anomaly
+                    amount = float(np.random.uniform(5000.0, 15000.0))
+                    rows.append([
+                        hour, day, 
+                        1.0, 1.0,
+                        amount,
+                        amount,
+                        0.0, 2.0,
+                        1.0,
+                        0.0,
+                        float(np.random.uniform(3.5, 8.0)) # High Z-score
+                    ])
+                elif anomaly_type == 3:
+                    # Fingerprint Mismatch / Unknown Device
+                    rows.append([
+                        hour, day, 
+                        0.0, 0.0, # Unknown device & location
+                        0.0, 0.0,
+                        0.0, 1.0,
+                        1.0,
+                        0.0,
+                        0.0
+                    ])
+                    
             X = np.array(rows)
             self.scaler = StandardScaler()
             X_scaled = self.scaler.fit_transform(X)
-
+            
+            # Contamination represents the proportion of outliers in the dataset
+            contamination_rate = num_anomalies / len(rows)
+            
             # 1. Isolation Forest
-            self.model = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
+            self.model = IsolationForest(n_estimators=100, contamination=contamination_rate, random_state=42)
             self.model.fit(X_scaled)
             
             # 2. PCA (For visualization)
             self.pca = PCA(n_components=2)
             self.pca.fit(X_scaled)
-
+            
             self.is_trained = True
-            self.training_samples = len(df)
+            self.training_samples = len(rows)
             self._save_model()
-            print(f"[ML] Hardcore training complete ({len(df)} samples).")
+            print(f"[ML] Hardcore training complete ({len(rows)} samples, contamination={contamination_rate:.4f}).")
             return True
         except Exception as e:
             print(f"[ML] Training failed: {e}")
